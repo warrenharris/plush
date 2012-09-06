@@ -20,25 +20,15 @@ module Plush.Job (
     ShellThread,
 
     -- * Jobs
-    JobName,
-    Status(..),
-    RunningState,
     submitJob,
-    reviewJobs,
-
-    -- * Job Input
+    pollJobs,
     offerInput,
-
-    -- * Job Output
-    OutputItem(..),
-    gatherOutput,
 
     ) where
 
 
 import Control.Applicative ((<$>), (<*>))
 import Control.Concurrent
-import Control.Monad (when)
 import Data.Aeson (Value)
 import System.Exit
 import System.IO
@@ -46,6 +36,7 @@ import System.Posix
 import qualified System.Posix.Missing as PM
 
 import Plush.Job.Output
+import Plush.Job.Types
 import Plush.Run
 import Plush.Run.Execute
 import Plush.Run.Posix (stdJsonOutput, toByteString, write)
@@ -53,11 +44,7 @@ import Plush.Run.ShellExec
 import Plush.Types
 
 
--- | Requests to the shell thread are given an identifier by the submitter.
-type JobName = String
 
--- | As output is gathered, it is return in pieces, tagged by the source.
-data OutputItem = OiStdOut String | OiStdErr String | OiJsonOut [Value]
 
 
 -- | An opaque type, holding information about a running job.
@@ -75,7 +62,7 @@ data RunningState = RS {
 data Status
     = Running RunningState
         -- ^ the 'RunningState' value can be used with 'gatherOutput'
-    | JobDone Int [OutputItem]
+    | JobDone ExitCode [OutputItem]
         -- ^ the exit status of the job, and any remaining gathered output
 
 type Request = (JobName, CommandList)
@@ -193,13 +180,9 @@ runJob scoreBoardVar (j, cl) frs closeMs r0 = do
             case f of
                 Just (Running rs') -> do
                     oi <- gatherOutput rs'
-                    return $ (j, JobDone exitStatus oi):sb'
+                    return $ (j, JobDone exitCode oi):sb'
                 _ -> return sb
         closeMs
-      where
-        exitStatus = case exitCode of
-            ExitSuccess -> 0
-            ExitFailure n -> n
 
 
 
@@ -208,23 +191,46 @@ runJob scoreBoardVar (j, cl) frs closeMs r0 = do
 submitJob :: ShellThread -> JobName -> CommandList -> IO ()
 submitJob st job cl = putMVar (stJobRequest st) (job, cl)
 
--- | Review jobs. Running jobs and recently done jobs are be passed to the
--- supplied review action. The list of results from the review action is
--- returned.
+-- | Poll jobs for status. A `RunningItem` or `FinishedItem` is returned for
+-- each job the shell knows about. `OutputItem` entries may be returned for
+-- either kind of job, and will come first.
 --
--- N.B.: Done jobs are removed from internal book-keeping once reviewed.
-reviewJobs :: ShellThread -> (JobName -> Status -> IO a) -> IO [a]
-reviewJobs st act = do
+-- N.B.: Finished jobs are removed from internal book-keeping once reviewed.
+pollJobs :: ShellThread -> IO [ReportOne StatusItem]
+pollJobs st = do
     readMVar (stScoreBoard st) >>= sequence_ . map checker
     modifyMVar (stScoreBoard st) $ \sb -> do
-        r <- mapM (uncurry act) sb
-        return (filter running sb, r)
+        r <- mapM (uncurry report) sb
+        return (filter running sb, concat r)
   where
     checker (_, Running rs) = rsCheckDone rs
     checker _ = return ()
 
     running (_, JobDone _ _) = False
     running _ = True
+
+    report :: JobName -> Status -> IO [ReportOne StatusItem]
+    report job (Running rs) = do
+        ois <- gatherOutput rs
+        report' job ois $ SiRunning RunningItem
+
+    report job (JobDone e ois) =
+        report' job ois $ SiFinished (FinishedItem e)
+
+    report' job ois si = return $ map (ReportOne job) $ map SiOutput ois ++ [si]
+
+-- | Gather as much output is available from stdout, stderr, and jsonout.
+gatherOutput :: RunningState -> IO [OutputItem]
+gatherOutput rs = do
+    out <- wrap OutputItemStdOut <$> getAvailable (rsStdOut rs)
+    err <- wrap OutputItemStdErr <$> getAvailable (rsStdErr rs)
+    jout <- wrap OutputItemJsonOut <$> getAvailable (rsJsonOut rs)
+    return $ out ++ err ++ jout
+  where
+    wrap _ [] = []
+    wrap c vs = [c vs]
+
+
 
 -- | Find a job by name in a 'ScoreBoard'. Returns the first 'Status' found,
 -- if any, and a copy of the 'ScoreBoard' without that job enry.
@@ -235,30 +241,18 @@ findJob _ [] = (Nothing,[])
 
 
 -- | Give input to a running job. If the job isn't running, then the input is
--- dropped on the floor. The boolean indicates if EOF should be signaled after
--- the input is sent.
-offerInput :: ShellThread -> JobName -> String -> Bool -> Maybe Signal -> IO ()
-offerInput st job input eof sig = modifyMVar_ (stScoreBoard st) $ \sb -> do
+-- dropped on the floor.
+offerInput :: ShellThread -> JobName -> InputItem -> IO ()
+offerInput st job input = modifyMVar_ (stScoreBoard st) $ \sb -> do
     case findJob job sb of
-        (Just (Running rs), _) -> do  -- TODO: should catch errors here
-            when (not $ null input) $ write (rsStdIn rs) $ toByteString input
-            when eof $ closeFd (rsStdIn rs)
-            case (sig, rsProcessID rs) of
-                (Just s, Just p) -> signalProcess s p
-                _ -> return ()
+        (Just (Running rs), _) -> send input rs
+            -- TODO: should catch errors here
         _ -> return ()
     return sb
-
--- | Gather as much output is available from stdout, stderr, and jsonout.
-gatherOutput :: RunningState -> IO [OutputItem]
-gatherOutput rs = do
-    out <- wrap OiStdOut <$> getAvailable (rsStdOut rs)
-    err <- wrap OiStdErr <$> getAvailable (rsStdErr rs)
-    jout <- wrap OiJsonOut <$> getAvailable (rsJsonOut rs)
-    return $ out ++ err ++ jout
   where
-    wrap _ [] = []
-    wrap c vs = [c vs]
-
+    send (InputItemInput s) rs = write (rsStdIn rs) $ toByteString s
+    send (InputItemEof) rs = closeFd (rsStdIn rs)
+    send (InputItemSignal sig) rs =
+        maybe (return ()) (signalProcess sig) $ rsProcessID rs
 
 

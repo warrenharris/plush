@@ -67,6 +67,7 @@ application shellThread key staticPath = dispatch
     [ (rule methodPost "^/api/run", jsonKeyApp $ runApp shellThread)
     , (rule methodPost "^/api/poll", jsonKeyApp $ pollApp shellThread)
     , (rule methodPost "^/api/input", jsonKeyApp $ inputApp shellThread)
+    , (rule methodPost "^/api/history", jsonKeyApp $ historyApp shellThread)
     ]
     staticApp
   where
