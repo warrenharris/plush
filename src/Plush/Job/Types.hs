@@ -35,6 +35,9 @@ module Plush.Job.Types (
     -- * Reports
     Report(..),
     ReportOne(..),
+
+    -- * Other
+    CommandRequest(..),
     ) where
 
 import Control.Applicative ((<$>), (<*>), (<|>), pure)
@@ -216,3 +219,19 @@ instance (FromJSON a) => FromJSON (ReportOne a) where
 extendObject :: Value -> [Pair] -> Value
 (Object o) `extendObject` ps = Object $ HM.fromList ps `HM.union` o
 v `extendObject` ps = object $ ("value" .= v) : ps
+
+-- | A request to run a job.
+-- JSON serialized as
+--
+-- @{ job: /j/, record: /r/, cmd: /s/ }@
+--
+-- The @record@ parameter says if the request should be recorded in history
+-- (defaults True).
+data CommandRequest = CommandRequest JobName Bool CommandItem
+instance FromJSON CommandRequest where
+    parseJSON j@(Object v) = do
+        job <- v .: "job"
+        record <- v .:? "record" .!= True
+        command <- parseJSON j
+        return $ CommandRequest job record command
+    parseJSON _ = mzero

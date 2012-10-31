@@ -29,7 +29,7 @@ module Plush.Job (
 
 import Control.Applicative ((<$>), (<*>))
 import Control.Concurrent
-import Data.Aeson (Value)
+import Data.Aeson (encode, ToJSON, Value)
 import System.Exit
 import System.IO
 import System.Posix
@@ -37,13 +37,11 @@ import qualified System.Posix.Missing as PM
 
 import Plush.Job.Output
 import Plush.Job.Types
+import Plush.Parser
 import Plush.Run
 import Plush.Run.Execute
 import Plush.Run.Posix (stdJsonOutput, toByteString, write)
 import Plush.Run.ShellExec
-import Plush.Types
-
-
 
 
 
@@ -56,6 +54,7 @@ data RunningState = RS {
      , rsJsonOut :: OutputStream Value
      , rsProcessID :: Maybe ProcessID
      , rsCheckDone :: IO ()
+     , rsHistory :: Maybe Fd -- | the history file for this command
      }
 
 -- | A job can be in one of these states:
@@ -65,12 +64,11 @@ data Status
     | JobDone ExitCode [OutputItem]
         -- ^ the exit status of the job, and any remaining gathered output
 
-type Request = (JobName, CommandList)
 type ScoreBoard = [(JobName, Status)]
 
 -- | A handle to the shell thread.
 data ShellThread = ShellThread
-    { stJobRequest :: MVar Request
+    { stJobRequest :: MVar CommandRequest
     , stScoreBoard :: MVar ScoreBoard
     }
 
@@ -106,7 +104,7 @@ startShell runner = do
     upperFd = Fd 20
 
 
-shellThread :: MVar Request -> MVar ScoreBoard -> Fd -> Runner -> IO ()
+shellThread :: MVar CommandRequest -> MVar ScoreBoard -> Fd -> Runner -> IO ()
 shellThread jobRequestVar scoreBoardVar devNullFd = go
   where
     go runner = do
@@ -139,32 +137,44 @@ shellThread jobRequestVar scoreBoardVar devNullFd = go
     srcFd `moveTo` destFd = dupTo srcFd destFd >> closeFd srcFd
 
 
-runJob :: MVar ScoreBoard -> Request
-    -> (Maybe ProcessID -> IO () -> RunningState) -> IO ()
+runJob :: MVar ScoreBoard -> CommandRequest
+    -> (Maybe ProcessID -> IO () -> Maybe Fd -> RunningState) -> IO ()
     -> Runner -> IO Runner
-runJob scoreBoardVar (j, cl) frs closeMs r0 = do
-    (et, r1) <- run (execType cl) r0
-    case et of
-        ExecuteForeground -> foreground r1
-        ExecuteMidground  -> background r1
-        ExecuteBackground -> foreground r1 -- TODO: fix!
+runJob scoreBoardVar (CommandRequest j rec (CommandItem cmd)) frs closeMs r0 = do
+    case parseNextCommand cmd of
+        Left _errs -> return r0    -- FIXME
+        Right (cl, _rest) -> runJob' cl
   where
-    foreground runner = do
-        setUp Nothing (return ())
-        (exitStatus, runner') <- runCommand runner
-        cleanUp exitStatus
-        return runner'
+    runJob' cl = do
+        (et, r1) <- run (execType cl) r0
+        case et of
+            ExecuteForeground -> foreground r1
+            ExecuteMidground  -> background r1
+            ExecuteBackground -> foreground r1 -- TODO: fix!
+      where
+        foreground runner = do
+            setUp Nothing (return ())
+            (exitStatus, runner') <- runCommand runner
+            cleanUp exitStatus
+            return runner'
 
-    background runner = do
-        pid <- forkProcess (closeMs >> runCommand runner >>= exitWith . fst)
-        setUp (Just pid) $ checkUp pid
-        return runner
+        background runner = do
+            pid <- forkProcess (closeMs >> runCommand runner >>= exitWith . fst)
+            setUp (Just pid) $ checkUp pid
+            return runner
 
-    runCommand runner = runCommandList cl runner >>= run getLastExitCode
+        runCommand runner = runCommandList cl runner >>= run getLastExitCode
 
     setUp mpid checker = do
+        hFd <- if rec
+            then Just `fmap` openFd "/tmp/history" ReadWrite (Just ownerRWMode) defaultFileFlags
+            else return Nothing
+        let rs = frs mpid checker hFd
+        writeHistory rs (CommandItem cmd)
         modifyMVar_ scoreBoardVar $ \sb ->
-            return $ (j, Running $ frs mpid checker) : sb
+            return $ (j, Running rs) : sb
+
+    ownerRWMode = ownerReadMode `unionFileModes` ownerWriteMode
 
     checkUp pid = do
         mStat <- getProcessStatus False False pid
@@ -180,6 +190,8 @@ runJob scoreBoardVar (j, cl) frs closeMs r0 = do
             case f of
                 Just (Running rs') -> do
                     oi <- gatherOutput rs'
+                    writeHistory rs' $ HiFinished $ FinishedItem exitCode
+                    maybe (return ()) closeFd (rsHistory rs')
                     return $ (j, JobDone exitCode oi):sb'
                 _ -> return sb
         closeMs
@@ -188,8 +200,8 @@ runJob scoreBoardVar (j, cl) frs closeMs r0 = do
 
 -- | Submit a job for processing.
 -- N.B.: This may block until the shell thread is able to receive a request.
-submitJob :: ShellThread -> JobName -> CommandList -> IO ()
-submitJob st job cl = putMVar (stJobRequest st) (job, cl)
+submitJob :: ShellThread -> CommandRequest -> IO ()
+submitJob st cr = putMVar (stJobRequest st) cr
 
 -- | Poll jobs for status. A `RunningItem` or `FinishedItem` is returned for
 -- each job the shell knows about. `OutputItem` entries may be returned for
@@ -225,11 +237,16 @@ gatherOutput rs = do
     out <- wrap OutputItemStdOut <$> getAvailable (rsStdOut rs)
     err <- wrap OutputItemStdErr <$> getAvailable (rsStdErr rs)
     jout <- wrap OutputItemJsonOut <$> getAvailable (rsJsonOut rs)
-    return $ out ++ err ++ jout
+    let ois = out ++ err ++ jout
+    mapM_ (writeHistory rs . HiOutput) ois
+    return ois
   where
     wrap _ [] = []
     wrap c vs = [c vs]
 
+
+writeHistory :: (ToJSON a) => RunningState -> a -> IO ()
+writeHistory rs s = maybe (return ()) (flip write $ encode s) $ rsHistory rs
 
 
 -- | Find a job by name in a 'ScoreBoard'. Returns the first 'Status' found,

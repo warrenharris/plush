@@ -54,12 +54,12 @@ instance ToJSON NullJson where
 
 -- | Run a command in the shell.
 runApp :: ShellThread
-    -> JsonApplication (ReportOne CommandItem) (ReportOne RunResponse)
-runApp shellThread (ReportOne job (CommandItem cmd)) = do
+    -> JsonApplication CommandRequest (ReportOne RunResponse)
+runApp shellThread cr@(CommandRequest job _ (CommandItem cmd)) = do
     r <- case parseNextCommand cmd of
         Left errs -> return $ RrParseError $ ParseErrorItem errs
-        Right (cl, _rest) -> do
-            liftIO $ submitJob shellThread job cl
+        Right _ -> do
+            liftIO $ submitJob shellThread cr
             return $ RrRunning RunningItem
     returnJson $ ReportOne job r
 

@@ -364,7 +364,7 @@ define(['history', 'cwd', 'jobs', 'jquery'], function(historyApi, cwd, jobs, $){
   });
 
   function runContext() {
-    api('run', {job: 'ctx', cmd: 'context'}, cmdResult);
+    api('run', {job: 'ctx', record: false, cmd: 'context'}, cmdResult);
   }
 
   function runHistory() {
@@ -390,7 +390,7 @@ define(['history', 'cwd', 'jobs', 'jquery'], function(historyApi, cwd, jobs, $){
     var loc = commandline[0].selectionStart;
     loc = (typeof loc === 'number') ? ' -c ' + loc : '';
     var cmd = "complete" + loc + " '" + input + "'";
-    api('run', {job: 'comp', cmd: cmd}, cmdResult);
+    api('run', {job: 'comp', record: false, cmd: cmd}, cmdResult);
   }
 
   // runContext();
