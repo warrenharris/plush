@@ -35,6 +35,7 @@ module Plush.Parser.Tokens (
     reservedWords
     )
 where
+
 import Control.Applicative ((<*), (*>))
 import Control.Monad
 import qualified Data.Char as Char
